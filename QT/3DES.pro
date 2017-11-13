@@ -7,7 +7,8 @@ SOURCES += main.cu \
         ../median.cu
 
 HEADERS += \
-    des_constants.h
+    des_constants.h \
+    definitions.h
 
 DISTFILES += \
     Makefile

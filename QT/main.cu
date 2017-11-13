@@ -6,55 +6,119 @@
 #include <stdint.h>
 #include <algorithm>
 
-//#include <math_constants.h>
-
 // CUDA runtime
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
-// libs
-#include <curand.h>
-#include <curand_kernel.h>
-#include <float.h>
-
 // User includes
-#include <des_constants.h>
+#include <definitions.h>
 
-// MACROS
-#define GET_RDTSC(lo,hi,time) {\
-    __asm__ volatile("rdtsc" : "=a" (lo), "=d" (hi));\
-    time = ((uint64_t)hi << 32) | lo;\
+/**
+ * @brief doShifting: a device function which is designed to do the "work" of masking a byte
+ * @param shiftArray: The shifting directions
+ * @param input: input byte array array to shift around
+ * @return
+ */
+__device__ byte doShifting(int * shiftArray, byte * input, int id)
+{
+    byte output = 0x00;
+
+    // Loop over all bits in current byte
+    for(int i = id * 8; i < (id+1)*8; i++) {
+
+        // determine bit to relocate
+        int bit = shiftArray[i] - 1;
+
+        // mask and shift
+        byte temp = input[bit/8]; // get approprate byte
+        temp = temp >> (8-(bit+1)%8)%8; // shift to position 0
+        temp &= 0x01; // mask in only this bit
+
+//        if(get_idx() == 6) printf("%d: %02x\n", i, temp);
+
+        temp = temp << 7 - i%8; // shift to right position
+
+        // set bits
+        output |= temp;
     }
 
-typedef unsigned char byte;
+    return output;
+}
 
 // Goes from 8 bytes downto 7
 __global__ void cuPC1(byte *key, byte *result)
 {
-    int id = threadIdx.x + blockIdx.x * blockDim.x;
+    int id = get_idx();
 
-    byte output = 0x00;
-
-    for(int i = id * 8; i < (id+1)*8; i++) {
-        // determine bit to relocate
-        int bit = PC_1[i] - 1;
-
-        byte temp = key[bit/8]; // get approprate byte
-        if(id == 0) printf("Key section: %x\n", temp);
-
-        temp = temp >> (bit+1)%8; // shift to position 0
-        temp &= 0x01; // mask in only this bit
-
-        if(id == 0) printf("%d, bit %d, res: %x\n", id, bit+1, temp);
-
-        temp = temp << i%8; // shift to right position
-
-        output |= temp;
-    }
-
-    result[id] = output;
+    result[id] = doShifting(PC_1, key, id);
 }
 
+// one thread per key
+__global__ void cuLeftCircShifts(byte * input, byte * result)
+{
+    int id = get_idx();
+    int shamt = id + 1;
+
+    uint upper = 0;
+    uint lower = 0;
+
+    for(int i = 0; i <= 3; i++) {
+        uint temp = 0;
+        temp += input[i];
+
+        temp = temp << (3-i)*8;
+        upper |= temp;
+    }
+
+    upper = upper >> 4;
+
+    for(int i = 3; i <= 6; i++) {
+        uint temp = 0;
+        temp |= input[i];
+        temp = temp << (6 - i)*8;
+        lower |= temp;
+    }
+
+    // mask out
+    lower &= 0x0FFFFFFF;
+
+    int numbits = 28; //7 nibbles
+    uint mask = upper >> numbits - shamt;
+    upper = upper << shamt;
+    upper |= mask;
+    upper &= 0x0FFFFFFF;
+
+    mask = lower >> numbits - shamt;
+    lower = lower << shamt;
+    lower |= mask;
+    lower &= 0x0FFFFFFF;
+
+    uint64_t out = upper;
+    out <<= numbits;
+    out |= lower;
+
+    int start = id*7;
+    for(int i = start; i < start+7; i++) {
+        result[i] = (out >> (6 - i%7)*8) & 0x0FF;
+    }
+
+    printf("id %d: %lx\n", id, out);
+}
+
+__global__ void cuPC2(byte * input, byte * round_keys)
+{
+    int id = get_idx();
+    int round = (id/6);
+
+    byte * x = &input[round*7];
+    for(int i = 0; i < 7; i++) {
+        if(id==7) printf("%02X\n", x[i]);
+    }
+
+    byte temp = doShifting(PC_2, &input[round*7], id%6);
+    if(id == 7) printf("Res: %0x\n", temp);
+    round_keys[id] = temp;
+}
 
 int main(int argc, char **argv)
 {
@@ -63,23 +127,36 @@ int main(int argc, char **argv)
 
     byte * inputKey;
     byte * output;
+    byte * after_shift;
+    byte * round_keys;
     cudaMalloc((void**)&inputKey, sizeof(byte)*8);
     cudaMalloc((void**)&output, sizeof(byte)*7);
+    cudaMalloc((void**)&after_shift, sizeof(byte)*16*7);
+    cudaMalloc((void**)&round_keys, sizeof(byte)*16*6);
 
     byte key[8] = {0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10};
 
     cudaMemcpy(inputKey, &key, sizeof(uint64_t), cudaMemcpyHostToDevice);
 
+    // Calculate all keys
     cuPC1<<<1,7>>>(inputKey, output);
+    cuLeftCircShifts<<<1,16>>>(output, after_shift);
+    cuPC2<<<1,96>>>(after_shift, round_keys); // 96 = 16*6
 
     cudaDeviceSynchronize();
 
-    byte result[7];
-    cudaMemcpy(result, output, 7, cudaMemcpyHostToDevice);
+    byte result[16*6];
+    cudaMemcpy(result, round_keys, 16*6, cudaMemcpyDeviceToHost);
 
     printf("Output: ");
-    for(int i = 0; i < 7; i++)
-        printf("%X",result[i]);
+    for(int i = 0; i < 16; i++) {
+        printf("Key %d:\n", i+1);
+
+        for(int j = i*6; j < i*6 + 6; j++)
+            printf("%02X",result[j]);
+
+        printf("\n");
+    }
 
     printf("\n");
 
