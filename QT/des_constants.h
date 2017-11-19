@@ -17,7 +17,8 @@ __constant__ int IP[] = {58, 50, 42, 34, 26, 18, 10, 2,
                          61, 53, 45, 37, 29, 21, 13, 5,
                          63, 55, 47, 39, 31, 23, 15, 7};
 
-__constant__ int key_shift_sizes[] = {1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1}; // TODO: There was a negative here, why?
+__constant__ int key_shift_sizes[]       = {1, 1, 2, 2, 2,  2,  2,  2,  1,  2,  2,  2,  2,  2,  2,  1}; // TODO: There was a negative here, why?
+__constant__ int total_key_shift_sizes[] = {1, 2, 4, 6, 8, 10, 12, 14, 15, 17, 19, 21, 23, 25, 27, 28}; // TODO: There was a negative here, why?
 
 __constant__ int PC_2[] = {14, 17, 11, 24,  1,  5,
                            3,  28, 15,  6, 21, 10,
