@@ -1,10 +1,11 @@
 // System includes
 #include <stdio.h>
 #include <iostream>
-#include <assert.h>
+#include <fstream>
 #include <unistd.h>
 #include <stdint.h>
-#include <algorithm>
+#include <string>
+#include <time.h>
 
 // CUDA runtime
 #include <cuda_runtime.h>
@@ -12,6 +13,27 @@
 
 // User includes
 #include <definitions.h>
+
+#define MAXBLOCKSIZE 960 // divisible by: 4, 6, 8 (set sizes) and 32 (warp size)
+
+// MACROS
+#define CEIL(x,y) (((x) + (y) - 1) / (y))
+
+byte * holding1;
+byte * R;
+byte * L;
+byte * holding2;
+byte * E_output;
+byte * Key_XOR_Output;
+byte * S_Box_Output;
+byte * P_Perm_Output;
+byte * P_XOR_Output;
+byte * inputKey;
+byte * output;
+byte * after_shift;
+byte * round_keys;
+
+size_t numSets;
 
 /**
  * @brief doShifting: a device function which is designed to do the "work" of masking a byte
@@ -108,62 +130,66 @@ __global__ void cuPC2(byte * input, byte * round_keys)
     int id = get_idx();
     int round = (id/6);
 
-    //    byte * x = &input[round*7];
-    //    for(int i = 0; i < 7; i++) {
-    //        if(id==7) printf("%02X\n", x[i]);
-    //    }
-
     byte temp = doShifting(PC_2, &input[round*7], id%6);
     //    if(id == 7) printf("Res: %0x\n", temp);
     round_keys[id] = temp;
 }
 
 // 64 -> 64
-__global__ void cuIP(byte * input, byte * output)
+__global__ void cuIP(byte * input, byte * output, int numItems)
 {
     int id = get_idx();
-
-    int offset = (id/8) * 8;
-    output[id] = doShifting(IP, input + offset, id%8);
-
-//    printf("IP: id = %d: %02x\t%02x\n", id, input[id], output[id]);
+    if(id < numItems * 8)
+    {
+        int offset = (id/8) * 8;
+        output[id] = doShifting(IP, input + offset, id%8);
+    }
+    //    printf("IP: id = %d: %02x\t%02x\n", id, input[id], output[id]);
 }
 
 // 32(64) -> 48
-__global__ void cuEPerm(byte * input, byte * output)
+__global__ void cuEPerm(byte * input, byte * output, int numItems)
 {
     int id = get_idx();
-
-    int offset = (id/6) * 4;
-    output[id] = doShifting(Ex, input + offset, id%6);
-
-//    printf("Ex: id = %d: %02x, input %02x\n", id, output[id], input[id]);
+    if(id < numItems * 4)
+    {
+        int offset = (id/6) * 4;
+        output[id] = doShifting(Ex, input + offset, id%6);
+    }
+    //    printf("Ex: id = %d: %02x, input %02x\n", id, output[id], input[id]);
 }
 
 // 48 -> 48
-__global__ void cuFixedXOR(byte * input, byte * key, byte * output)
+__global__ void cuFixedXOR(byte * input, byte * key, byte * output, int numItems)
 {
     int id = get_idx();
 
-    output[id] = input[id] ^ key[id%6]; // fixed size for stuff
-
-//    printf("XOR: id = %d: in %02X, Key %02X, out %02x\n", id, input[id], key[id%fixedSize], output[id]);
+    if(id < numItems * 6)
+    {
+        output[id] = input[id] ^ key[id%6]; // fixed size for stuff
+    }
+    //    printf("XOR: id = %d: in %02X, Key %02X, out %02x\n", id, input[id], key[id%fixedSize], output[id]);
 }
 
 // usually 32 -> 32
-__global__ void cuXOR(byte * input, byte * operand, byte * output)
+__global__ void cuXOR(byte * input, byte * operand, byte * output, int numItems)
 {
     int id = get_idx();
-
-    output[id] = input[id] ^ operand[id];
-
-//    printf("XOR: id = %d: in %02X, Key %02X, out %02x\n", id, input[id], key[id], output[id]);
+    if(id < numItems * 4)
+    {
+        output[id] = input[id] ^ operand[id];
+    }
+    //    printf("XOR: id = %d: in %02X, Key %02X, out %02x\n", id, input[id], key[id], output[id]);
 }
 
 // 48 -> 32
-__global__ void cuSBoxes(byte * input, byte * output, byte * temp)
+__global__ void cuSBoxes(byte * input, byte * output, byte * temp, int numItems)
 {
     int id = get_idx();
+
+    if(id >= numItems * 8)
+        return;
+
     output[id] = 0;
 
     int off = (id/8) * 6;
@@ -201,57 +227,62 @@ __global__ void cuSBoxes(byte * input, byte * output, byte * temp)
         output[id/2 + 2] = temp[id + 4];
         output[id/2 + 3] = temp[id + 6];
 
-//        printf("S-BOX: %02X%02X%02X%02X\n", output[id + 0], output[id + 1], output[id + 2], output[id + 3]);
+        //        printf("S-BOX: %02X%02X%02X%02X\n", output[id + 0], output[id + 1], output[id + 2], output[id + 3]);
     }
 
-//    printf("SBOX: id = %d; input = %02X, output = %02X\n", id, input[id], output[id]);
+    //    printf("SBOX: id = %d; input = %02X, output = %02X\n", id, input[id], output[id]);
 
     //    printf("SBOX: id = %d: %02X -> shamt %d row: %d, col %d, res: %x, out %02x\n", id, test, (7 - modId)*6, row, col, result, output[id]);
 }
 
-__global__ void cuPPerm(byte * input, byte * output)
+__global__ void cuPPerm(byte * input, byte * output, int numItems)
 {
     int id = get_idx();
-
-    int offset = (id/4) * 4;
-    output[id] = doShifting(Pf, input + offset, id%4);
-
-//    printf("P: id = %d: in: %02X, out: %02x\n", id, input[id], output[id]);
+    if(id < numItems*4)
+    {
+        int offset = (id/4) * 4;
+        output[id] = doShifting(Pf, input + offset, id%4);
+    }
+    //    printf("P: id = %d: in: %02X, out: %02x\n", id, input[id], output[id]);
 }
 
-__global__ void cuCombine(byte * L, byte * R, byte * output)
+__global__ void cuCombine(byte * L, byte * R, byte * output, int numItems)
 {
     int id = get_idx();
 
-    int offset = (id/8) * 4;
-    if(id % 8 < 4)
-        output[id] = L[id%4 + offset];
-    else
-        output[id] = R[id%4 + offset];
-
+    if(id < numItems*8)
+    {
+        int offset = (id/8) * 4;
+        if(id % 8 < 4)
+            output[id] = L[id%4 + offset];
+        else
+            output[id] = R[id%4 + offset];
+    }
     //    printf("output: id = %d: %02x\n", id, output[id]);
 }
 
-__global__ void cuDeinterlace(byte * input, byte * L, byte * R)
+__global__ void cuDeinterlace(byte * input, byte * L, byte * R, int numItems)
 {
     int id = get_idx();
-
-    int offset = id/8 * 4;
-    if(id % 8 < 4)
-        L[id%4 + offset] = input[id];
-    else
-        R[id%4 + offset] = input[id];
-
-//    printf("Deinterlace: id = %d: %02x; L %02X, R %02X\n", id, input[id], L[id], R[id]);
+    if(id < numItems*8)
+    {
+        int offset = id/8 * 4;
+        if(id % 8 < 4)
+            L[id%4 + offset] = input[id];
+        else
+            R[id%4 + offset] = input[id];
+    }
+    //    printf("Deinterlace: id = %d: %02x; L %02X, R %02X\n", id, input[id], L[id], R[id]);
 }
 
-__global__ void cuIPInv(byte * input, byte * output)
+__global__ void cuIPInv(byte * input, byte * output, int numItems)
 {
     int id = get_idx();
-
-    int offset = (id/8) * 8;
-    output[id] = doShifting(IP_Inv, input + offset, id%8);
-
+    if(id < numItems*8)
+    {
+        int offset = (id/8) * 8;
+        output[id] = doShifting(IP_Inv, input + offset, id%8);
+    }
     //    printf("IP inv: id = %d: %02x\n", id, output[id]);
 }
 
@@ -259,38 +290,26 @@ __global__ void cuIPInv(byte * input, byte * output)
 void DES_Encrypt(byte *key, byte * input, byte * output);
 void DES_Decrypt(byte *key, byte * input, byte * output);
 
-byte * holding1;
-byte * R;
-byte * L;
-byte * holding2;
-byte * E_output;
-byte * Key_XOR_Output;
-byte * S_Box_Output;
-byte * P_Perm_Output;
-byte * P_XOR_Output;
-byte * inputKey;
-byte * output;
-byte * after_shift;
-byte * round_keys;
-
-size_t numSets = 2;
-
 int main(int argc, char **argv)
 {
-    //    byte * inputKey;
-    //    byte * output;
-    //    byte * after_shift;
-    //    byte * round_keys;
-    //    byte * holding1;
-    //    byte * R;
-    //    byte * L;
-    //    byte * holding2;
-    //    byte * E_output;
-    //    byte * Key_XOR_Output;
-    //    byte * S_Box_Output;
-    //    byte * P_Perm_Output;
-    //    byte * P_XOR_Output;
 
+    std::ifstream inFile(argv[1], std::ios::binary | std::ios::ate);
+    size_t numBytes = inFile.tellg();
+
+    inFile.close();
+    inFile.open(argv[1], std::ios::in);
+
+    byte * plaintext = new byte[numBytes];
+
+    inFile.read((char *)plaintext, numBytes);
+
+    numSets = CEIL(strlen((char * )plaintext), 8);
+    //    printf("numSets: %d\n", numSets);
+
+    clock_t start, finish;
+    start = clock();
+
+    cudaMalloc((void**)&inputKey, sizeof(byte)*8*3);
     cudaMalloc((void**)&inputKey, sizeof(byte)*8*3);
     cudaMalloc((void**)&output, sizeof(byte)*7);
     cudaMalloc((void**)&after_shift, sizeof(byte)*16*7);
@@ -306,18 +325,20 @@ int main(int argc, char **argv)
     cudaMalloc((void**)&P_Perm_Output, sizeof(byte)*4 * numSets);
     cudaMalloc((void**)&P_XOR_Output, sizeof(byte)*4 * numSets);
 
-    byte key[] = { 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
-                   0x01, 0x01, 0xFF, 0xFF, 0xDD, 0xDD, 0xAA, 0xAA,
-                   0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
+    //    byte key[] = { 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+    //                   0x01, 0x01, 0xFF, 0xFF, 0xDD, 0xDD, 0xAA, 0xAA,
+    //                   0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
+
+    byte key[] = "ABCDEFGHIJKLMNOPQRSTUVW";
 
     //    byte plaintext[] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF};
-//    byte plaintext[] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
-//                         0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10 };
+    //    byte plaintext[] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+    //                         0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10 };
 
-    byte plaintext[] = "Clemson Tigers!";
+
 
     cudaMemcpy(inputKey, &key, sizeof(uint64_t)*3, cudaMemcpyHostToDevice);
-    cudaMemcpy(holding1, &plaintext, sizeof(uint64_t) * numSets, cudaMemcpyHostToDevice);
+    cudaMemcpy(holding1, plaintext, 8 * numSets, cudaMemcpyHostToDevice);
 
     // Calculate all keys
     // DES 1
@@ -354,59 +375,74 @@ int main(int argc, char **argv)
     DES_Decrypt(round_keys+96, holding2, holding1);
     DES_Encrypt(round_keys+2*96, holding1, holding2);
 
-    byte output[8 * numSets];
-    cudaMemcpy(&output, holding2, sizeof(byte)*8 * numSets, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    finish = clock();
+    double time_taken = (double)(finish - start)/(double)CLOCKS_PER_SEC;
 
-    printf("Encrypted Result:\n");
-    for(int j = 0; j < 8 * numSets; j++)
-    {
-        printf("%02X ", output[j]);
-    }
-    printf("\n");
-    printf("%s\n", output);
+    printf("Total time: %lf seconds\n", time_taken);
 
-    DES_Decrypt(round_keys+2*96, holding2, holding1);
-    DES_Encrypt(round_keys+96, holding1, holding2);
-    DES_Decrypt(round_keys, holding2, holding1);
+    //    byte output[8 * numSets];
+    //    cudaMemcpy(&output, holding2, sizeof(byte)*8 * numSets, cudaMemcpyDeviceToHost);
 
-    cudaMemcpy(&output, holding1, sizeof(byte)*8 * numSets, cudaMemcpyDeviceToHost);
+    //    printf("Encrypted Result:\n");
+    //    for(int j = 0; j < 8 * numSets; j++)
+    //    {
+    ////        printf("%02X ", output[j]);
+    //    }
+    //    printf("\n");
+    ////    printf("%s\n", output);
 
-    printf("\n\nDecrypted Result:\n");
-    for(int j = 0; j < 8 * numSets; j++)
-    {
-        printf("%02X ", output[j]);
-    }
-    printf("\n");
-    printf("%s\n", output);
+    //    DES_Decrypt(round_keys+2*96, holding2, holding1);
+    //    DES_Encrypt(round_keys+96, holding1, holding2);
+    //    DES_Decrypt(round_keys, holding2, holding1);
+
+    //    cudaMemcpy(&output, holding1, sizeof(byte)*8 * numSets, cudaMemcpyDeviceToHost);
+
+    //    printf("\n\nDecrypted Result:\n");
+    //    for(int j = 0; j < 8 * numSets; j++)
+    //    {
+    ////       printf("%02X ", output[j]);
+    //    }
+    //    printf("\n");
+    ////    printf("%s\n", output);
 
     return 0;
 }
 
 void DES_Encrypt(byte *key, byte * input, byte * output)
 {
+    dim3 numThreads(MAXBLOCKSIZE, 1);
+
+    int temp = CEIL(numSets*4, MAXBLOCKSIZE);
+    dim3 numBlocks4(temp, 1);
+    temp = CEIL(numSets*6, MAXBLOCKSIZE);
+    dim3 numBlocks6(temp, 1);
+    temp = CEIL(numSets*8, MAXBLOCKSIZE);
+    dim3 numBlocks8(temp, 1);
+
     // Encrypt
-    cuIP<<<1,8 * numSets>>>(input, output);
-    cuDeinterlace<<<1,8 * numSets>>>(output, L, R); // put them in backwards at first!
+    cuIP<<<numBlocks8, numThreads>>>(input, output, numSets);
+    cuDeinterlace<<<numBlocks8, numThreads>>>(output, L, R, numSets); // put them in backwards at first!
 
     for(int i = 0; i < 16; i++)
     {
-//                printf("\n\nRound %d\n", i+1);
+        //                printf("\n\nRound %d\n", i+1);
         // Expansion
-        cuEPerm<<<1,6 * numSets>>>(R, E_output);
+        cuEPerm<<<numBlocks6, numThreads>>>(R, E_output, numSets);
         // XOR with round key
-        cuFixedXOR<<<1,6 * numSets>>>(E_output, &key[i*6], Key_XOR_Output);
+        cuFixedXOR<<<numBlocks6, numThreads>>>(E_output, &key[i*6], Key_XOR_Output, numSets);
 
         // S-Boxes
-        cuSBoxes<<<1,8 * numSets>>>(Key_XOR_Output, S_Box_Output, output);
+        cuSBoxes<<<numBlocks8, numThreads>>>(Key_XOR_Output, S_Box_Output, output, numSets);
         // P Perm
-        cuPPerm<<<1,4 * numSets>>>(S_Box_Output, P_Perm_Output);
+        cuPPerm<<<numBlocks4, numThreads>>>(S_Box_Output, P_Perm_Output, numSets);
         // XOR with L-1
-        cuXOR<<<1,4 * numSets>>>(P_Perm_Output, L, P_XOR_Output);
+        cuXOR<<<numBlocks4, numThreads>>>(P_Perm_Output, L, P_XOR_Output, numSets);
         // Copy L to R
         cudaMemcpy(L, R, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
         cudaMemcpy(R, P_XOR_Output, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
 
-//                cudaDeviceSynchronize();
+        //                cudaDeviceSynchronize();
         //        byte l[4];
         //        byte r[4];
         //        cudaMemcpy(l, L, 4, cudaMemcpyDeviceToHost);
@@ -423,31 +459,40 @@ void DES_Encrypt(byte *key, byte * input, byte * output)
     cudaMemcpy(R, L, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
     cudaMemcpy(L, P_XOR_Output, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
 
-    cuCombine<<<1, 8 * numSets>>>(L, R, input);
+    cuCombine<<<numBlocks8, numThreads>>>(L, R, input, numSets);
 
-    cuIPInv<<<1, 8 * numSets>>>(input, output);
+    cuIPInv<<<numBlocks8, numThreads>>>(input, output, numSets);
 }
 
 void DES_Decrypt(byte *key, byte * input, byte * output)
 {
+    dim3 numThreads(MAXBLOCKSIZE, 1);
+
+    int temp = CEIL(numSets*4, MAXBLOCKSIZE);
+    dim3 numBlocks4(temp, 1);
+    temp = CEIL(numSets*6, MAXBLOCKSIZE);
+    dim3 numBlocks6(temp, 1);
+    temp = CEIL(numSets*8, MAXBLOCKSIZE);
+    dim3 numBlocks8(temp, 1);
+
     // Decrypt
-    cuIP<<<1,8 * numSets>>>(input, output);
-    cuDeinterlace<<<1,8 * numSets>>>(output, L, R); // put them in backwards at first!
+    cuIP<<<numBlocks8, numThreads>>>(input, output, numSets);
+    cuDeinterlace<<<numBlocks8, numThreads>>>(output, L, R, numSets); // put them in backwards at first!
 
     for(int i = 15; i >= 0; i--)
     {
-//         printf("\n\nRound %d\n", i+1);
+        //         printf("\n\nRound %d\n", i+1);
         // Expansion
-        cuEPerm<<<1,6 * numSets>>>(R, E_output);
+        cuEPerm<<<numBlocks6, numThreads>>>(R, E_output, numSets);
         // XOR with round key
-        cuFixedXOR<<<1,6 * numSets>>>(E_output, &key[i*6], Key_XOR_Output);
+        cuFixedXOR<<<numBlocks6, numThreads>>>(E_output, &key[i*6], Key_XOR_Output, numSets);
 
         // S-Boxes
-        cuSBoxes<<<1,8 * numSets>>>(Key_XOR_Output, S_Box_Output, output);
+        cuSBoxes<<<numBlocks8, numThreads>>>(Key_XOR_Output, S_Box_Output, output, numSets);
         // P Perm
-        cuPPerm<<<1,4 * numSets>>>(S_Box_Output, P_Perm_Output);
+        cuPPerm<<<numBlocks4, numThreads>>>(S_Box_Output, P_Perm_Output, numSets);
         // XOR with L-1
-        cuXOR<<<1,4 * numSets>>>(P_Perm_Output, L, P_XOR_Output);
+        cuXOR<<<numBlocks4, numThreads>>>(P_Perm_Output, L, P_XOR_Output, numSets);
         // Copy L to R
         cudaMemcpy(L, R, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
         cudaMemcpy(R, P_XOR_Output, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
@@ -469,7 +514,7 @@ void DES_Decrypt(byte *key, byte * input, byte * output)
     cudaMemcpy(R, L, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
     cudaMemcpy(L, P_XOR_Output, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
 
-    cuCombine<<<1, 8 * numSets>>>(L, R, input);
+    cuCombine<<<numBlocks8, numThreads>>>(L, R, input, numSets);
 
-    cuIPInv<<<1, 8 * numSets>>>(input, output);
+    cuIPInv<<<numBlocks8, numThreads>>>(input, output, numSets);
 }
