@@ -303,8 +303,8 @@ int main(int argc, char **argv)
 
     inFile.read((char *)plaintext, numBytes);
 
-    numSets = CEIL(strlen((char * )plaintext), 8);
-    //    printf("numSets: %d\n", numSets);
+    numSets = CEIL(/*strlen((char * )plaintext)*/numBytes, 8);
+        printf("numSets: %d\n", numSets);
 
     clock_t start, finish;
     start = clock();
@@ -334,8 +334,6 @@ int main(int argc, char **argv)
     //    byte plaintext[] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF};
     //    byte plaintext[] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
     //                         0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10 };
-
-
 
     cudaMemcpy(inputKey, &key, sizeof(uint64_t)*3, cudaMemcpyHostToDevice);
     cudaMemcpy(holding1, plaintext, 8 * numSets, cudaMemcpyHostToDevice);
