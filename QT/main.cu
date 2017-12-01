@@ -33,7 +33,7 @@ byte * output;
 byte * after_shift;
 byte * round_keys;
 
-size_t numSets;
+size_t numBlocksToEncrypt;
 
 /**
  * @brief doShifting: a device function which is designed to do the "work" of masking a byte
@@ -151,12 +151,12 @@ __global__ void cuIP(byte * input, byte * output, int numItems)
 __global__ void cuEPerm(byte * input, byte * output, int numItems)
 {
     int id = get_idx();
-    if(id < numItems * 4)
+    if(id < numItems * 6)
     {
         int offset = (id/6) * 4;
         output[id] = doShifting(Ex, input + offset, id%6);
+//        printf("Ex: id = %d: %02x, input %02x\n", id, output[id], input[id]);
     }
-    //    printf("Ex: id = %d: %02x, input %02x\n", id, output[id], input[id]);
 }
 
 // 48 -> 48
@@ -167,8 +167,8 @@ __global__ void cuFixedXOR(byte * input, byte * key, byte * output, int numItems
     if(id < numItems * 6)
     {
         output[id] = input[id] ^ key[id%6]; // fixed size for stuff
+//        printf("XOR: id = %d: in %02X, Key %02X, out %02x\n", id, input[id], key[id%6], output[id]);
     }
-    //    printf("XOR: id = %d: in %02X, Key %02X, out %02x\n", id, input[id], key[id%fixedSize], output[id]);
 }
 
 // usually 32 -> 32
@@ -282,29 +282,118 @@ __global__ void cuIPInv(byte * input, byte * output, int numItems)
     {
         int offset = (id/8) * 8;
         output[id] = doShifting(IP_Inv, input + offset, id%8);
+        printf("IP inv: id = %d: %02x\n", id, output[id]);
     }
-    //    printf("IP inv: id = %d: %02x\n", id, output[id]);
 }
 
 
 void DES_Encrypt(byte *key, byte * input, byte * output);
 void DES_Decrypt(byte *key, byte * input, byte * output);
+enum ActionType {
+    DECRYPT,
+    ENCRYPT
+};
 
+#define ARG_GENERATE_KEY "-g"
+#define ARG_ENCRYPT "-e"
+#define ARG_DECRYPT "-d"
+#define ARG_HELP "-h"
+#define KEY_BYTES 8*3
 int main(int argc, char **argv)
 {
+    ActionType work;
+    if (argc < 2 ||
+            strcmp(argv[1], ARG_HELP) == 0) {
 
-    std::ifstream inFile(argv[1], std::ios::binary | std::ios::ate);
+        printf("Usage:\n");
+        printf("Generate Key: -g: <output file>\n");
+        printf("Encrypt: -e <key_file> <input_P> <output_C>:\n");
+        printf("Decrypt: -d <key_file> <input_C> <output_P>\n");
+        return 1;
+    }
+
+    if (strcmp(argv[1], ARG_GENERATE_KEY) == 0) { // Generate key file
+        if (argc != 3) {
+            printf("Invalid # of parameter specified.");
+            return 1;
+        }
+
+        std::ofstream key_file(argv[2], std::ios::binary);
+        if (!key_file.is_open()) {
+            printf("Could not open file to write key.");
+            return 1;
+        }
+
+        // rand generator
+        uint32_t iseed = (uint32_t)time(NULL);
+        srand (iseed);
+
+        // generate key
+        byte* des_key = new byte[KEY_BYTES];
+        for(int i = 0; i < KEY_BYTES; i++)
+            des_key[i] = rand() % 255;
+
+        // write out a key
+        key_file.write((char *)des_key, KEY_BYTES);
+
+        delete des_key;
+        key_file.close();
+        return 0;
+    } else if(strcmp(argv[1], ARG_ENCRYPT) == 0) {
+        work = ENCRYPT;
+        if (argc != 5) {
+            printf("Invalid # of parameter specified.");
+            return 1;
+        }
+    } else if(strcmp(argv[1], ARG_DECRYPT) == 0) {
+        work = DECRYPT;
+        if (argc != 5) {
+            printf("Invalid # of parameter specified.");
+            return 1;
+        }
+    } else {
+        return 1;
+    }
+
+    std::ifstream keyFile(argv[2], std::ios::binary);
+    std::ifstream inFile(argv[3], std::ios::binary | std::ios::ate);
+    std::ofstream outFile(argv[4], std::ios::binary);
+
+    if(!keyFile.is_open()
+            || !inFile.is_open()
+            || !outFile.is_open()) {
+        printf("One or more files not opened!\n");
+        return 1;
+    }
+
+    // count input
     size_t numBytes = inFile.tellg();
 
-    inFile.close();
-    inFile.open(argv[1], std::ios::in);
+    inFile.seekg(0);
 
+    // read infile
     byte * plaintext = new byte[numBytes];
-
     inFile.read((char *)plaintext, numBytes);
 
-    numSets = CEIL(/*strlen((char * )plaintext)*/numBytes, 8);
-        printf("numSets: %d\n", numSets);
+    numBlocksToEncrypt = CEIL(numBytes, 8);
+    printf("Operating on %lu blocks\n", numBlocksToEncrypt);
+
+    byte *key = new byte[KEY_BYTES];
+    keyFile.read((char *)key, KEY_BYTES);
+
+    printf("Input:\n");
+    for(int j = 0; j < 8; j++)
+    {
+        printf("%02X ", plaintext[j]);
+    }
+    printf("\n");
+
+    printf("Key:\n");
+    for(int j = 0; j < 8; j++)
+    {
+        printf("%02X ", key[j]);
+    }
+    printf("\n");
 
     clock_t start, finish;
     start = clock();
@@ -315,28 +404,18 @@ int main(int argc, char **argv)
     cudaMalloc((void**)&after_shift, sizeof(byte)*16*7);
     cudaMalloc((void**)&round_keys, sizeof(byte)*16*6*3);
 
-    cudaMalloc((void**)&holding1, sizeof(byte)*8 * numSets);
-    cudaMalloc((void**)&L, sizeof(byte)*4 * numSets);
-    cudaMalloc((void**)&R, sizeof(byte)*4 * numSets);
-    cudaMalloc((void**)&holding2, sizeof(byte)*8 * numSets);
-    cudaMalloc((void**)&E_output, sizeof(byte)*6 * numSets);
-    cudaMalloc((void**)&Key_XOR_Output, sizeof(byte)*6 * numSets);
-    cudaMalloc((void**)&S_Box_Output, sizeof(byte)*4 * numSets);
-    cudaMalloc((void**)&P_Perm_Output, sizeof(byte)*4 * numSets);
-    cudaMalloc((void**)&P_XOR_Output, sizeof(byte)*4 * numSets);
+    cudaMalloc((void**)&holding1, sizeof(byte)*8 * numBlocksToEncrypt);
+    cudaMalloc((void**)&L, sizeof(byte)*4 * numBlocksToEncrypt);
+    cudaMalloc((void**)&R, sizeof(byte)*4 * numBlocksToEncrypt);
+    cudaMalloc((void**)&holding2, sizeof(byte)*8 * numBlocksToEncrypt);
+    cudaMalloc((void**)&E_output, sizeof(byte)*6 * numBlocksToEncrypt);
+    cudaMalloc((void**)&Key_XOR_Output, sizeof(byte)*6 * numBlocksToEncrypt);
+    cudaMalloc((void**)&S_Box_Output, sizeof(byte)*4 * numBlocksToEncrypt);
+    cudaMalloc((void**)&P_Perm_Output, sizeof(byte)*4 * numBlocksToEncrypt);
+    cudaMalloc((void**)&P_XOR_Output, sizeof(byte)*4 * numBlocksToEncrypt);
 
-    //    byte key[] = { 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
-    //                   0x01, 0x01, 0xFF, 0xFF, 0xDD, 0xDD, 0xAA, 0xAA,
-    //                   0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
-
-    byte key[] = "ABCDEFGHIJKLMNOPQRSTUVW";
-
-    //    byte plaintext[] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF};
-    //    byte plaintext[] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
-    //                         0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10 };
-
-    cudaMemcpy(inputKey, &key, sizeof(uint64_t)*3, cudaMemcpyHostToDevice);
-    cudaMemcpy(holding1, plaintext, 8 * numSets, cudaMemcpyHostToDevice);
+    cudaMemcpy(inputKey, key, sizeof(uint64_t)*3, cudaMemcpyHostToDevice);
+    cudaMemcpy(holding1, plaintext, 8 * numBlocksToEncrypt, cudaMemcpyHostToDevice);
 
     // Calculate all keys
     // DES 1
@@ -354,55 +433,33 @@ int main(int argc, char **argv)
     cuLeftCircShifts<<<1,16>>>(output, after_shift);
     cuPC2<<<1,96>>>(after_shift, round_keys+2*(96)); // 96 = 16*6
 
-    byte hostKeys[96*3];
-    cudaMemcpy(hostKeys, round_keys, sizeof(byte)*16*6*3, cudaMemcpyDeviceToHost);
 
-    //    for(int i = 0; i < 16*3; i++)
-    //    {
-    //        if((i+1)%16==0){
-    //            printf("Round %d key:\n", i+1);
-    //            for(int j = 0; j < 6; j++)
-    //            {
-    //                printf("%02X ", hostKeys[i*6 + j]);
-    //            }
-    //            printf("\n");
-    //        }
-    //    }
+    // Do encryption or decryption
+    switch (work) {
+    case ENCRYPT:
+        DES_Encrypt(round_keys, holding1, holding2);
+        DES_Decrypt(round_keys+96, holding2, holding1);
+        DES_Encrypt(round_keys+2*96, holding1, holding2);
+        break;
+    case DECRYPT:
+        DES_Decrypt(round_keys+2*96, holding1, holding2);
+        DES_Encrypt(round_keys+96, holding2, holding1);
+        DES_Decrypt(round_keys, holding1, holding2);
+        break;
+    default:
+        break;
+    }
 
-    DES_Encrypt(round_keys, holding1, holding2);
-    DES_Decrypt(round_keys+96, holding2, holding1);
-    DES_Encrypt(round_keys+2*96, holding1, holding2);
-
+    // timing methods
     cudaDeviceSynchronize();
     finish = clock();
     double time_taken = (double)(finish - start)/(double)CLOCKS_PER_SEC;
 
     printf("Total time: %lf seconds\n", time_taken);
 
-    //    byte output[8 * numSets];
-    //    cudaMemcpy(&output, holding2, sizeof(byte)*8 * numSets, cudaMemcpyDeviceToHost);
-
-    //    printf("Encrypted Result:\n");
-    //    for(int j = 0; j < 8 * numSets; j++)
-    //    {
-    ////        printf("%02X ", output[j]);
-    //    }
-    //    printf("\n");
-    ////    printf("%s\n", output);
-
-    //    DES_Decrypt(round_keys+2*96, holding2, holding1);
-    //    DES_Encrypt(round_keys+96, holding1, holding2);
-    //    DES_Decrypt(round_keys, holding2, holding1);
-
-    //    cudaMemcpy(&output, holding1, sizeof(byte)*8 * numSets, cudaMemcpyDeviceToHost);
-
-    //    printf("\n\nDecrypted Result:\n");
-    //    for(int j = 0; j < 8 * numSets; j++)
-    //    {
-    ////       printf("%02X ", output[j]);
-    //    }
-    //    printf("\n");
-    ////    printf("%s\n", output);
+    // write to output
+    cudaMemcpy(plaintext, holding2, sizeof(byte)*8 * numBlocksToEncrypt, cudaMemcpyDeviceToHost);
+    outFile.write((char *)plaintext, numBytes);
 
     return 0;
 }
@@ -411,89 +468,90 @@ void DES_Encrypt(byte *key, byte * input, byte * output)
 {
     dim3 numThreads(MAXBLOCKSIZE, 1);
 
-    int temp = CEIL(numSets*4, MAXBLOCKSIZE);
+    int temp = CEIL(numBlocksToEncrypt*4, MAXBLOCKSIZE);
     dim3 numBlocks4(temp, 1);
-    temp = CEIL(numSets*6, MAXBLOCKSIZE);
+    temp = CEIL(numBlocksToEncrypt*6, MAXBLOCKSIZE);
     dim3 numBlocks6(temp, 1);
-    temp = CEIL(numSets*8, MAXBLOCKSIZE);
+    temp = CEIL(numBlocksToEncrypt*8, MAXBLOCKSIZE);
     dim3 numBlocks8(temp, 1);
 
     // Encrypt
-    cuIP<<<numBlocks8, numThreads>>>(input, output, numSets);
-    cuDeinterlace<<<numBlocks8, numThreads>>>(output, L, R, numSets); // put them in backwards at first!
+    cuIP<<<numBlocks8, numThreads>>>(input, output, numBlocksToEncrypt);
+    cuDeinterlace<<<numBlocks8, numThreads>>>(output, L, R, numBlocksToEncrypt); // put them in backwards at first!
 
     for(int i = 0; i < 16; i++)
     {
         //                printf("\n\nRound %d\n", i+1);
         // Expansion
-        cuEPerm<<<numBlocks6, numThreads>>>(R, E_output, numSets);
+        cuEPerm<<<numBlocks6, numThreads>>>(R, E_output, numBlocksToEncrypt);
         // XOR with round key
-        cuFixedXOR<<<numBlocks6, numThreads>>>(E_output, &key[i*6], Key_XOR_Output, numSets);
+        cuFixedXOR<<<numBlocks6, numThreads>>>(E_output, &key[i*6], Key_XOR_Output, numBlocksToEncrypt);
 
         // S-Boxes
-        cuSBoxes<<<numBlocks8, numThreads>>>(Key_XOR_Output, S_Box_Output, output, numSets);
+        cuSBoxes<<<numBlocks8, numThreads>>>(Key_XOR_Output, S_Box_Output, output, numBlocksToEncrypt);
         // P Perm
-        cuPPerm<<<numBlocks4, numThreads>>>(S_Box_Output, P_Perm_Output, numSets);
+        cuPPerm<<<numBlocks4, numThreads>>>(S_Box_Output, P_Perm_Output, numBlocksToEncrypt);
         // XOR with L-1
-        cuXOR<<<numBlocks4, numThreads>>>(P_Perm_Output, L, P_XOR_Output, numSets);
+        cuXOR<<<numBlocks4, numThreads>>>(P_Perm_Output, L, P_XOR_Output, numBlocksToEncrypt);
         // Copy L to R
-        cudaMemcpy(L, R, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
-        cudaMemcpy(R, P_XOR_Output, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(L, R, sizeof(byte)*4 * numBlocksToEncrypt, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(R, P_XOR_Output, sizeof(byte)*4 * numBlocksToEncrypt, cudaMemcpyDeviceToDevice);
 
-        //                cudaDeviceSynchronize();
-        //        byte l[4];
-        //        byte r[4];
-        //        cudaMemcpy(l, L, 4, cudaMemcpyDeviceToHost);
-        //        cudaMemcpy(r, R, 4, cudaMemcpyDeviceToHost);
+//                cudaDeviceSynchronize();
+//                byte l[4];
+//                byte r[4];
+//                cudaMemcpy(l, L, 4, cudaMemcpyDeviceToHost);
+//                cudaMemcpy(r, R, 4, cudaMemcpyDeviceToHost);
 
-        //        for(int ii = 0; ii < 4; ii++) printf("%02x ", l[ii]);
-        //        for(int ii = 0; ii < 4; ii++) printf("%02x ", r[ii]);
-        //        printf("\n");
+//                for(int ii = 0; ii < 4; ii++) printf("%02x ", l[ii]);
+//                for(int ii = 0; ii < 4; ii++) printf("%02x ", r[ii]);
+//                printf("\n");
 
+//                sleep(100);
     }
 
     // swap 32 bits
-    cudaMemcpy(P_XOR_Output, R, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
-    cudaMemcpy(R, L, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
-    cudaMemcpy(L, P_XOR_Output, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(P_XOR_Output, R, sizeof(byte)*4 * numBlocksToEncrypt, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(R, L, sizeof(byte)*4 * numBlocksToEncrypt, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(L, P_XOR_Output, sizeof(byte)*4 * numBlocksToEncrypt, cudaMemcpyDeviceToDevice);
 
-    cuCombine<<<numBlocks8, numThreads>>>(L, R, input, numSets);
+    cuCombine<<<numBlocks8, numThreads>>>(L, R, input, numBlocksToEncrypt);
 
-    cuIPInv<<<numBlocks8, numThreads>>>(input, output, numSets);
+    cuIPInv<<<numBlocks8, numThreads>>>(input, output, numBlocksToEncrypt);
 }
 
 void DES_Decrypt(byte *key, byte * input, byte * output)
 {
     dim3 numThreads(MAXBLOCKSIZE, 1);
 
-    int temp = CEIL(numSets*4, MAXBLOCKSIZE);
+    int temp = CEIL(numBlocksToEncrypt*4, MAXBLOCKSIZE);
     dim3 numBlocks4(temp, 1);
-    temp = CEIL(numSets*6, MAXBLOCKSIZE);
+    temp = CEIL(numBlocksToEncrypt*6, MAXBLOCKSIZE);
     dim3 numBlocks6(temp, 1);
-    temp = CEIL(numSets*8, MAXBLOCKSIZE);
+    temp = CEIL(numBlocksToEncrypt*8, MAXBLOCKSIZE);
     dim3 numBlocks8(temp, 1);
 
     // Decrypt
-    cuIP<<<numBlocks8, numThreads>>>(input, output, numSets);
-    cuDeinterlace<<<numBlocks8, numThreads>>>(output, L, R, numSets); // put them in backwards at first!
+    cuIP<<<numBlocks8, numThreads>>>(input, output, numBlocksToEncrypt);
+    cuDeinterlace<<<numBlocks8, numThreads>>>(output, L, R, numBlocksToEncrypt); // put them in backwards at first!
 
     for(int i = 15; i >= 0; i--)
     {
         //         printf("\n\nRound %d\n", i+1);
         // Expansion
-        cuEPerm<<<numBlocks6, numThreads>>>(R, E_output, numSets);
+        cuEPerm<<<numBlocks6, numThreads>>>(R, E_output, numBlocksToEncrypt);
         // XOR with round key
-        cuFixedXOR<<<numBlocks6, numThreads>>>(E_output, &key[i*6], Key_XOR_Output, numSets);
+        cuFixedXOR<<<numBlocks6, numThreads>>>(E_output, &key[i*6], Key_XOR_Output, numBlocksToEncrypt);
 
         // S-Boxes
-        cuSBoxes<<<numBlocks8, numThreads>>>(Key_XOR_Output, S_Box_Output, output, numSets);
+        cuSBoxes<<<numBlocks8, numThreads>>>(Key_XOR_Output, S_Box_Output, output, numBlocksToEncrypt);
         // P Perm
-        cuPPerm<<<numBlocks4, numThreads>>>(S_Box_Output, P_Perm_Output, numSets);
+        cuPPerm<<<numBlocks4, numThreads>>>(S_Box_Output, P_Perm_Output, numBlocksToEncrypt);
         // XOR with L-1
-        cuXOR<<<numBlocks4, numThreads>>>(P_Perm_Output, L, P_XOR_Output, numSets);
+        cuXOR<<<numBlocks4, numThreads>>>(P_Perm_Output, L, P_XOR_Output, numBlocksToEncrypt);
         // Copy L to R
-        cudaMemcpy(L, R, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
-        cudaMemcpy(R, P_XOR_Output, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(L, R, sizeof(byte)*4 * numBlocksToEncrypt, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(R, P_XOR_Output, sizeof(byte)*4 * numBlocksToEncrypt, cudaMemcpyDeviceToDevice);
 
         //        cudaDeviceSynchronize();
         //        byte l[4];
@@ -508,11 +566,11 @@ void DES_Decrypt(byte *key, byte * input, byte * output)
     }
 
     // swap 32 bits
-    cudaMemcpy(P_XOR_Output, R, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
-    cudaMemcpy(R, L, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
-    cudaMemcpy(L, P_XOR_Output, sizeof(byte)*4 * numSets, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(P_XOR_Output, R, sizeof(byte)*4 * numBlocksToEncrypt, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(R, L, sizeof(byte)*4 * numBlocksToEncrypt, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(L, P_XOR_Output, sizeof(byte)*4 * numBlocksToEncrypt, cudaMemcpyDeviceToDevice);
 
-    cuCombine<<<numBlocks8, numThreads>>>(L, R, input, numSets);
+    cuCombine<<<numBlocks8, numThreads>>>(L, R, input, numBlocksToEncrypt);
 
-    cuIPInv<<<numBlocks8, numThreads>>>(input, output, numSets);
+    cuIPInv<<<numBlocks8, numThreads>>>(input, output, numBlocksToEncrypt);
 }
