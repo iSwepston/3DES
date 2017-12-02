@@ -158,7 +158,7 @@ __global__ void cuEPerm(byte * input, byte * output, int numItems)
     {
         int offset = (id/6) * 4;
         output[id] = doShifting(Ex, input + offset, id%6);
-//        printf("Ex: id = %d: %02x, input %02x\n", id, output[id], input[id]);
+        //        printf("Ex: id = %d: %02x, input %02x\n", id, output[id], input[id]);
     }
 }
 
@@ -170,7 +170,7 @@ __global__ void cuFixedXOR(byte * input, byte * key, byte * output, int numItems
     if(id < numItems * 6)
     {
         output[id] = input[id] ^ key[id%6]; // fixed size for stuff
-//        printf("XOR: id = %d: in %02X, Key %02X, out %02x\n", id, input[id], key[id%6], output[id]);
+        //        printf("XOR: id = %d: in %02X, Key %02X, out %02x\n", id, input[id], key[id%6], output[id]);
     }
 }
 
@@ -285,7 +285,7 @@ __global__ void cuIPInv(byte * input, byte * output, int numItems)
     {
         int offset = (id/8) * 8;
         output[id] = doShifting(IP_Inv, input + offset, id%8);
-        printf("IP inv: id = %d: %02x\n", id, output[id]);
+        //printf("IP inv: id = %d: %02x\n", id, output[id]);
     }
 }
 
@@ -304,14 +304,17 @@ enum ActionType {
 #define KEY_BYTES 8*3
 int main(int argc, char **argv)
 {
+    clock_t veryBeginning = clock();
+
+
     size_t availableBytes;
     size_t total;
     cudaMemGetInfo(&availableBytes, &total);
     printf("Total Memory: %lf\nFree Memory: %lf\n", ((double)total )/(1 << 20), ((double)availableBytes )/(1 << 20));
 
-    size_t maxBytesPerEncrypt = 8+4+4+8+6+6+4+4+4+4; // based on space in future bits
-    maxBytesPerEncrypt = (availableBytes / maxBytesPerEncrypt);
-    printf("Max encrypt count = %lf\n", ((double)maxBytesPerEncrypt )/(1 << 20));
+    int64_t maxBytesPerEncrypt = 8+4+4+8+6+6+4+4+4+4; // based on space in future bits
+    maxBytesPerEncrypt = (availableBytes / maxBytesPerEncrypt) * 8;
+    printf("Max encrypt Per cycle = %lf MB\n", ((double)maxBytesPerEncrypt )/(1 << 20));
 
     ActionType work;
     if (argc < 2 ||
@@ -378,37 +381,23 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    int64_t numBytesRemaining = inFile.tellg();
+
     // count input
-    size_t numBytes = inFile.tellg();
-    if(numBytes % 8 != 0)
-        numBytes += (8 - numBytes%8); // round to 8
+    size_t numBytesThisCycle = std::min(maxBytesPerEncrypt, numBytesRemaining);
+    if(numBytesThisCycle % 8 != 0)
+        numBytesThisCycle += (8 - numBytesThisCycle%8); // round up to 8
+
+    byte *plaintext = new byte[numBytesThisCycle];
 
     inFile.seekg(0);
 
-    // read infile
-    byte * plaintext = new byte[numBytes];
-    inFile.read((char *)plaintext, numBytes);
-
-    numBlocksToEncrypt = CEIL(numBytes, 8);
+    numBlocksToEncrypt = CEIL(numBytesThisCycle, 8);
     printf("Operating on %lu blocks\n", numBlocksToEncrypt);
 
     printf("Reading\n");
     byte *key = new byte[KEY_BYTES];
     keyFile.read((char *)key, KEY_BYTES);
-
-//    printf("Input:\n");
-//    for(int j = 0; j < numBytes; j++)
-//    {
-//        printf("%02X ", plaintext[j]);
-//    }
-//    printf("\n");
-
-//    printf("Key:\n");
-//    for(int j = 0; j < 8; j++)
-//    {
-//        printf("%02X ", key[j]);
-//    }
-//    printf("\n");
 
     cudaMalloc((void**)&inputKey, sizeof(byte)*8*3);
     cudaMalloc((void**)&inputKey, sizeof(byte)*8*3);
@@ -427,14 +416,7 @@ int main(int argc, char **argv)
     cudaMalloc((void**)&P_Perm_Output, sizeof(byte)*4 * numBlocksToEncrypt);
     cudaMalloc((void**)&P_XOR_Output, sizeof(byte)*4 * numBlocksToEncrypt);
 
-    clock_t start, finish;
-    start = clock();
 
-
-    cudaMemcpy(inputKey, key, sizeof(uint64_t)*3, cudaMemcpyHostToDevice);
-    cudaMemcpy(holding1, plaintext, 8 * numBlocksToEncrypt, cudaMemcpyHostToDevice);
-
-    clock_t afterCopy = clock();
     // Calculate all keys
     // DES 1
     cuPC1<<<1,7>>>(inputKey, output);
@@ -452,34 +434,60 @@ int main(int argc, char **argv)
     cuPC2<<<1,96>>>(after_shift, round_keys+2*(96)); // 96 = 16*6
 
 
-    // Do encryption or decryption
-    switch (work) {
-    case ENCRYPT:
-        DES_Encrypt(round_keys, holding1, holding2);
-        DES_Decrypt(round_keys+96, holding2, holding1);
-        DES_Encrypt(round_keys+2*96, holding1, holding2);
-        break;
-    case DECRYPT:
-        DES_Decrypt(round_keys+2*96, holding1, holding2);
-        DES_Encrypt(round_keys+96, holding2, holding1);
-        DES_Decrypt(round_keys, holding1, holding2);
-        break;
-    default:
-        return -1;
+    while (numBytesRemaining > 0) {
+
+        size_t numBytesThisCycle = std::min(maxBytesPerEncrypt, numBytesRemaining);
+        if(numBytesThisCycle % 8 != 0)
+            numBytesThisCycle += (8 - numBytesThisCycle%8); // round to 8
+
+        numBytesRemaining -= numBytesThisCycle;
+
+        numBlocksToEncrypt = CEIL(numBytesThisCycle, 8);
+        printf("Operating on %lu blocks\n", numBlocksToEncrypt);
+
+        inFile.read((char *)plaintext, numBytesThisCycle);
+
+        clock_t start = clock();
+
+        cudaMemcpy(inputKey, key, sizeof(uint64_t)*3, cudaMemcpyHostToDevice);
+        cudaMemcpy(holding1, plaintext, 8 * numBlocksToEncrypt, cudaMemcpyHostToDevice);
+
+        clock_t afterCopy = clock();
+
+        // Do encryption or decryption
+        switch (work) {
+        case ENCRYPT:
+            DES_Encrypt(round_keys, holding1, holding2);
+            DES_Decrypt(round_keys+96, holding2, holding1);
+            DES_Encrypt(round_keys+2*96, holding1, holding2);
+            break;
+        case DECRYPT:
+            DES_Decrypt(round_keys+2*96, holding1, holding2);
+            DES_Encrypt(round_keys+96, holding2, holding1);
+            DES_Decrypt(round_keys, holding1, holding2);
+            break;
+        default:
+            return -1;
+        }
+        clock_t afterCompute = clock();
+        // timing methods
+        cudaDeviceSynchronize();
+        // write to output
+        cudaMemcpy(plaintext, holding2, sizeof(byte)*8 * numBlocksToEncrypt, cudaMemcpyDeviceToHost);
+
+        clock_t finish = clock();
+        double Total_time_taken = (double)(finish - start)/(double)CLOCKS_PER_SEC;
+        double compute_time = (double)(afterCompute - afterCopy)/(double)CLOCKS_PER_SEC;
+
+        printf("With File IO time: %lf seconds\nCompute only %lf\n", Total_time_taken, compute_time);
+
+        outFile.write((char *)plaintext, numBytesThisCycle);
     }
-    clock_t afterCompute = clock();
-    // timing methods
-    cudaDeviceSynchronize();
-    // write to output
-    cudaMemcpy(plaintext, holding2, sizeof(byte)*8 * numBlocksToEncrypt, cudaMemcpyDeviceToHost);
 
-    finish = clock();
-    double Total_time_taken = (double)(finish - start)/(double)CLOCKS_PER_SEC;
-    double compute_time = (double)(afterCompute - afterCopy)/(double)CLOCKS_PER_SEC;
+    clock_t veryEnd = clock();
+    double total_time = (double)(veryEnd - veryBeginning)/(double)CLOCKS_PER_SEC;
+    printf("Total time: %lf seconds\n", total_time);
 
-    printf("Total time: %lf seconds\nCompute only %lf", Total_time_taken, compute_time);
-
-    outFile.write((char *)plaintext, numBytes);
 
     return 0;
 }
@@ -526,14 +534,14 @@ void DES_Encrypt(byte *key, byte * input, byte * output)
             P_XOR_Output = temp;
         }
 
-                byte l[4];
-                byte r[4];
-                cudaMemcpy(l, L, 4, cudaMemcpyDeviceToHost);
-                cudaMemcpy(r, R, 4, cudaMemcpyDeviceToHost);
+//        byte l[4];
+//        byte r[4];
+//        cudaMemcpy(l, L, 4, cudaMemcpyDeviceToHost);
+//        cudaMemcpy(r, R, 4, cudaMemcpyDeviceToHost);
 
-                for(int ii = 0; ii < 4; ii++) printf("%02x ", l[ii]);
-                for(int ii = 0; ii < 4; ii++) printf("%02x ", r[ii]);
-                printf("\n");
+//        for(int ii = 0; ii < 4; ii++) printf("%02x ", l[ii]);
+//        for(int ii = 0; ii < 4; ii++) printf("%02x ", r[ii]);
+//        printf("\n");
     }
 
     cuCombine<<<numBlocks8, numThreads>>>(L, R, input, numBlocksToEncrypt);
